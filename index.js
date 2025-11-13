@@ -4,7 +4,6 @@ const helmet = require('helmet');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
-const { RateLimiterMemory } = require('rate-limiter-flexible');
 
 const useRedis = (process.env.USE_REDIS === 'true');
 let RedisClient = null;
@@ -26,11 +25,32 @@ app.use(cors({ origin: FRONTEND }));
 // in-memory OTP fallback
 const otps = new Map();
 
-// rate limiter
-const rateLimiter = new RateLimiterMemory({
-  points: OTP_MAX_PER_HOUR,
-  duration: 3600,
-});
+// Simple in-memory rate limit (per IP)
+const requestCounts = {};
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+  if (!requestCounts[ip]) {
+    requestCounts[ip] = { count: 1, time: now };
+    return true;
+  }
+
+  const diff = now - requestCounts[ip].time;
+
+  // reset after 1 hour
+  if (diff > 3600000) {
+    requestCounts[ip] = { count: 1, time: now };
+    return true;
+  }
+
+  if (requestCounts[ip].count >= 6) {
+    return false;
+  }
+
+  requestCounts[ip].count += 1;
+  return true;
+}
+
 
 // Gmail SMTP transporter
 const transporter = nodemailer.createTransport({
@@ -96,7 +116,9 @@ function buildMailHtml(otp) {
 // SEND OTP
 app.post('/send-otp', async (req, res) => {
   try {
-    await rateLimiter.consume(req.ip);
+   if (!checkRateLimit(req.ip)) {
+  return res.status(429).json({ ok: false, error: "rate_limited" });
+}
 
     const { email } = req.body;
     if (!email || typeof email !== 'string') {
