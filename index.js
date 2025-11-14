@@ -1,190 +1,110 @@
-require('dotenv').config();
-const express = require('express');
-const helmet = require('helmet');
-const cors = require('cors');
-const nodemailer = require('nodemailer');
-const crypto = require('crypto');
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import nodemailer from "nodemailer";
 
-const useRedis = (process.env.USE_REDIS === 'true');
-let RedisClient = null;
-if (useRedis) {
-  const IORedis = require('ioredis');
-  RedisClient = new IORedis(process.env.REDIS_URL);
-}
-
-const PORT = process.env.PORT || 8080;
-const OTP_TTL = parseInt(process.env.OTP_TTL_SECONDS || '300', 10);
-const OTP_MAX_PER_HOUR = parseInt(process.env.OTP_MAX_PER_HOUR || '6', 10);
-const FRONTEND = process.env.FRONTEND_ALLOWED_ORIGIN || '*';
+dotenv.config();
 
 const app = express();
-app.use(helmet());
 app.use(express.json());
-app.use(cors({ origin: FRONTEND }));
 
-// in-memory OTP fallback
-const otps = new Map();
+// allow all origins (Flutter friendly)
+app.use(cors({ origin: "*" }));
 
-// Simple in-memory rate limit (per IP)
-const requestCounts = {};
+const PORT = process.env.PORT || 8080;
 
-function checkRateLimit(ip) {
-  const now = Date.now();
-  if (!requestCounts[ip]) {
-    requestCounts[ip] = { count: 1, time: now };
-    return true;
-  }
-
-  const diff = now - requestCounts[ip].time;
-
-  // reset after 1 hour
-  if (diff > 3600000) {
-    requestCounts[ip] = { count: 1, time: now };
-    return true;
-  }
-
-  if (requestCounts[ip].count >= 6) {
-    return false;
-  }
-
-  requestCounts[ip].count += 1;
-  return true;
-}
-
-
-// Gmail SMTP transporter
+// -------------------------------
+// Setup Brevo SMTP transporter
+// -------------------------------
 const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.gmail.com',
-  port: parseInt(process.env.SMTP_PORT || '465', 10),
-  secure: true,
+  host: process.env.SMTP_HOST,   // smtp-relay.brevo.com
+  port: Number(process.env.SMTP_PORT), // 587
+  secure: false, // Brevo uses TLS STARTTLS, not SSL
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
   },
 });
 
-// store OTP
-async function storeOtp(key, otp) {
-  if (useRedis && RedisClient) {
-    await RedisClient.setex(key, OTP_TTL, otp);
-  } else {
-    const expiresAt = Date.now() + OTP_TTL * 1000;
-    otps.set(key, { otp, expiresAt });
-  }
-}
-
-async function getOtp(key) {
-  if (useRedis && RedisClient) {
-    return await RedisClient.get(key);
-  } else {
-    const entry = otps.get(key);
-    if (!entry) return null;
-    if (Date.now() > entry.expiresAt) {
-      otps.delete(key);
-      return null;
-    }
-    return entry.otp;
-  }
-}
-
-async function deleteOtp(key) {
-  if (useRedis && RedisClient) {
-    await RedisClient.del(key);
-  } else {
-    otps.delete(key);
-  }
-}
-
-function generateOtp() {
-  return String(crypto.randomInt(100000, 1000000));
-}
-
-function buildMailHtml(otp) {
-  return `
-  <div style="font-family:Arial;color:#111;">
-    <h2>Ruve verification code</h2>
-    <p>Your one-time code:</p>
-    <div style="padding:12px;background:#f3f3f3;display:inline-block;font-size:22px;letter-spacing:5px;">
-      <strong>${otp}</strong>
-    </div>
-    <p style="color:#666;font-size:12px;margin-top:10px;">
-      This code expires in ${Math.round(OTP_TTL / 60)} minutes.
-    </p>
-  </div>`;
-}
-
+// -------------------------------
 // SEND OTP
-app.post('/send-otp', async (req, res) => {
+// -------------------------------
+const otpStore = {};
+
+app.post("/send-otp", async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ error: "email_required" });
+  }
+
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
+  otpStore[email] = {
+    otp,
+    expires: Date.now() + 5 * 60 * 1000, // expires in 5 mins
+  };
+
   try {
-   if (!checkRateLimit(req.ip)) {
-  return res.status(429).json({ ok: false, error: "rate_limited" });
-}
-
-    const { email } = req.body;
-    if (!email || typeof email !== 'string') {
-      return res.status(400).json({ ok: false, error: 'invalid_email' });
-    }
-
-    // simple format check
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).json({ ok: false, error: 'invalid_email' });
-    }
-
-    const otp = generateOtp();
-    const key = `otp:${email.toLowerCase()}`;
-
-    await storeOtp(key, otp);
-
     await transporter.sendMail({
-      from: `"Ruve" <${process.env.SMTP_USER}>`,
+      from: `"Ruve OTP" <${process.env.SMTP_USER}>`,
       to: email,
-      subject: 'Ruve verification code',
-      html: buildMailHtml(otp),
+      subject: "Your Ruve OTP Code",
+      text: `Your OTP is: ${otp}`,
+      html: `
+        <div style="font-family:Arial;font-size:16px;">
+          <p>Your OTP code:</p>
+          <h2 style="letter-spacing:2px;">${otp}</h2>
+          <p>This code is valid for 5 minutes.</p>
+        </div>
+      `,
     });
 
-    return res.json({ ok: true, message: 'otp_sent' });
+    return res.json({ ok: true, message: "otp_sent" });
   } catch (err) {
-    if (err && err.msBeforeNext) {
-      return res.status(429).json({ ok: false, error: 'rate_limited' });
-    }
-    console.error('send-otp error:', err);
-    return res.status(500).json({ ok: false, error: 'server_error' });
+    console.error("SMTP ERROR:", err);
+    return res.status(500).json({ error: "email_failed" });
   }
 });
 
+// -------------------------------
 // VERIFY OTP
-app.post('/verify-otp', async (req, res) => {
-  try {
-    const { email, otp } = req.body;
-    if (!email || !otp) {
-      return res.status(400).json({ ok: false, error: 'invalid_payload' });
-    }
+// -------------------------------
+app.post("/verify-otp", (req, res) => {
+  const { email, otp } = req.body;
 
-    const key = `otp:${email.toLowerCase()}`;
-    const storedOtp = await getOtp(key);
-
-    if (!storedOtp) {
-      return res.status(400).json({ ok: false, error: 'otp_expired' });
-    }
-
-    if (storedOtp !== otp) {
-      return res.status(400).json({ ok: false, error: 'invalid_otp' });
-    }
-
-    await deleteOtp(key);
-
-    return res.json({ ok: true, message: 'otp_verified' });
-  } catch (err) {
-    console.error('verify-otp error:', err);
-    return res.status(500).json({ ok: false, error: 'server_error' });
+  if (!email || !otp) {
+    return res.status(400).json({ error: "missing_fields" });
   }
+
+  const entry = otpStore[email];
+
+  if (!entry) {
+    return res.status(400).json({ error: "otp_not_sent" });
+  }
+
+  if (Date.now() > entry.expires) {
+    delete otpStore[email];
+    return res.status(400).json({ error: "otp_expired" });
+  }
+
+  if (entry.otp !== otp) {
+    return res.status(400).json({ error: "invalid_otp" });
+  }
+
+  delete otpStore[email];
+
+  return res.json({ ok: true, message: "otp_verified" });
 });
 
-// health
-app.get('/_health', (req, res) => {
+// -------------------------------
+// HEALTH CHECK
+// -------------------------------
+app.get("/_health", (req, res) => {
   res.json({ ok: true });
 });
 
+// -------------------------------
 app.listen(PORT, () => {
-  console.log(`Ruve OTP server running on port ${PORT}`);
+  console.log(`Ruve OTP backend running on port ${PORT}`);
 });
