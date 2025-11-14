@@ -1,7 +1,13 @@
-# ruve-backend
+# Ruve OTP Backend
 
-This backend sends OTP codes to email using Gmail SMTP and verifies them.
-Flutter calls this backend before creating the Firebase account.
+OTP backend using:
+- Node.js
+- Brevo (Sendinblue) SMTP
+- Express
+- Nodemailer
+- Render hosting
 
-## Commands
-Install dependencies:
+## Environment Variables
+
+Create a `.env` (not committed) based on the `.env.example`:
+
